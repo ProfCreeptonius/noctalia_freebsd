@@ -10,18 +10,25 @@
 #include "util/string_utils.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <numeric>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <sys/statvfs.h>
 #include <unordered_map>
 #include <vector>
+
+// FreeBSD-Specific includes
+#include <sys/sysctl.h>
 
 namespace {
 
@@ -412,14 +419,76 @@ namespace {
     return total;
   }
 
-  noctalia::system::cpu_temp::ProbeResult readCpuTempSensor(const SystemConfig::MonitorConfig& config) {
-    try {
-      return noctalia::system::cpu_temp::read("/sys/class/hwmon", "/sys/class/thermal", config.cpuTempSensorPath);
-    } catch (...) {
+  /// Obtains CPU count, or returns empty optional on error. FreeBSD-Specific implementation.
+  std::optional<size_t> getCpuCount() {
+    size_t ncpu = 0;
+    size_t len = sizeof(size_t);
+    int success = sysctlbyname("hw.ncpu", &ncpu, &len, nullptr, 0);
+    if (success < 0) {
+      return std::nullopt;
+    }
+    return std::optional{ncpu};
+  }
+
+  double decikelvinToCelsius(size_t decikelvin) {
+    constexpr size_t DECIKELVIN_CONVERSION_CONSTANT = 2731;
+    return double(decikelvin - DECIKELVIN_CONVERSION_CONSTANT) / 10;
+  }
+
+  noctalia::system::cpu_temp::ProbeResult readCpuTempSensor(const SystemConfig::MonitorConfig& /*unused*/) {
+    auto ncpu = getCpuCount();
+    if (!ncpu.has_value())
       return noctalia::system::cpu_temp::ProbeResult{
-          .reading = std::nullopt, .error = "CPU temperature sensor scan failed"
+          .reading = std::nullopt, .error = "CPU temperature sensor scan failed."
+      };
+    if (*ncpu > 1000) {
+      return noctalia::system::cpu_temp::ProbeResult{
+          .reading = std::nullopt, .error = "Too many cores reported, this doesn't make sense."
       };
     }
+    int mib[4] = {0};
+    size_t len = 4;
+    constexpr std::string_view FIRST_CORE_TEMP_SYSCTL = "dev.cpu.0.temperature";
+    int success = sysctlnametomib(FIRST_CORE_TEMP_SYSCTL.data(), mib, &len);
+    if (success < 0) {
+      return noctalia::system::cpu_temp::ProbeResult{
+          .reading = std::nullopt,
+          .error = std::format(
+              "Error calling sysctl for temperature. If you are using an AMD cpu: did you kldload amdtemp? Errno: {}",
+              errno
+          )
+      };
+    }
+    std::vector<size_t> coreTemperatureReading(*ncpu, 0);
+    // Assuming that there are strictly less than 10000 cores should be a safe bet.
+    // If not, the code gracefully fails anyways. This seems like the best compromise for performance.
+    constexpr size_t MAX_SYSCTL_LEN = FIRST_CORE_TEMP_SYSCTL.size() + 3;
+    std::array<char, MAX_SYSCTL_LEN + 1> sysctlString{0};
+    for (size_t i = 0; i < *ncpu; ++i) {
+      std::snprintf(sysctlString.data(), MAX_SYSCTL_LEN, "dev.cpu.%zu.temperature", i);
+      size_t temperature = 0;
+      size_t length = sizeof(size_t);
+      success = sysctlbyname(sysctlString.data(), &temperature, &length, nullptr, 0);
+      if (success < 0) {
+        return noctalia::system::cpu_temp::ProbeResult{
+            .reading = std::nullopt, .error = std::format("Error calling sysctl: {}", errno)
+        };
+      } else
+        coreTemperatureReading[i] = temperature;
+    }
+    size_t tempAverageDecikelvin = std::reduce(
+                                       coreTemperatureReading.begin(), coreTemperatureReading.end(), size_t(0),
+                                       [](size_t a, size_t b) { return a + b; }
+                                   )
+        / coreTemperatureReading.size();
+    return noctalia::system::cpu_temp::ProbeResult{
+        .reading =
+            noctalia::system::cpu_temp::Reading{
+                .tempC = decikelvinToCelsius(tempAverageDecikelvin),
+                .source = "sysctl dev.cpu.{core_number}.temperature"
+            },
+        .error = ""
+    };
   }
 
   GpuHwmonProbe readGpuHwmonTempSensor() {
