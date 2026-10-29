@@ -16,10 +16,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
+#include <expected>
 #include <filesystem>
 #include <format>
 #include <fstream>
-#include <numeric>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -435,52 +435,70 @@ namespace {
     return double(decikelvin - DECIKELVIN_CONVERSION_CONSTANT) / 10;
   }
 
-  noctalia::system::cpu_temp::ProbeResult readCpuTempSensor(const SystemConfig::MonitorConfig& /*unused*/) {
+  constexpr size_t CPU_TEMP_MIB_LEN = 4;
+
+  struct CpuTempMibEntry {
+    int mib[CPU_TEMP_MIB_LEN];
+  };
+
+  std::expected<std::vector<CpuTempMibEntry>, std::string> getAllCpuTempMibs() {
     auto ncpu = getCpuCount();
     if (!ncpu.has_value())
-      return noctalia::system::cpu_temp::ProbeResult{
-          .reading = std::nullopt, .error = "CPU temperature sensor scan failed."
-      };
-    if (*ncpu > 1000) {
-      return noctalia::system::cpu_temp::ProbeResult{
-          .reading = std::nullopt, .error = "Too many cores reported, this doesn't make sense."
-      };
+      return std::unexpected{"Sysctl hw.ncpu failed."};
+
+    constexpr size_t CPU_MAX_CORES = 10000;
+    if (*ncpu >= CPU_MAX_CORES) {
+      return std::unexpected{"Too many cores reported, this doesn't make sense."};
     }
-    int mib[4] = {0};
-    size_t len = 4;
+
+    constexpr size_t CPU_MAX_CORES_DIGITS = [](size_t maxCores) consteval -> size_t {
+      size_t result = 1;
+      while (maxCores >= 10) {
+        maxCores /= 10;
+        ++result;
+      }
+      return result;
+    }(CPU_MAX_CORES);
+
+    std::vector<CpuTempMibEntry> result;
+    result.reserve(*ncpu);
     constexpr std::string_view FIRST_CORE_TEMP_SYSCTL = "dev.cpu.0.temperature";
-    int success = sysctlnametomib(FIRST_CORE_TEMP_SYSCTL.data(), mib, &len);
-    if (success < 0) {
-      return noctalia::system::cpu_temp::ProbeResult{
-          .reading = std::nullopt,
-          .error = std::format(
-              "Error calling sysctl for temperature. If you are using an AMD cpu: did you kldload amdtemp? Errno: {}",
-              errno
-          )
-      };
-    }
-    std::vector<size_t> coreTemperatureReading(*ncpu, 0);
-    // Assuming that there are strictly less than 10000 cores should be a safe bet.
-    // If not, the code gracefully fails anyways. This seems like the best compromise for performance.
-    constexpr size_t MAX_SYSCTL_LEN = FIRST_CORE_TEMP_SYSCTL.size() + 3;
+    constexpr size_t MAX_SYSCTL_LEN = FIRST_CORE_TEMP_SYSCTL.size() + CPU_MAX_CORES_DIGITS;
     std::array<char, MAX_SYSCTL_LEN + 1> sysctlString{0};
     for (size_t i = 0; i < *ncpu; ++i) {
       std::snprintf(sysctlString.data(), MAX_SYSCTL_LEN, "dev.cpu.%zu.temperature", i);
-      size_t temperature = 0;
-      size_t length = sizeof(size_t);
-      success = sysctlbyname(sysctlString.data(), &temperature, &length, nullptr, 0);
+      size_t length = CPU_TEMP_MIB_LEN;
+      result.emplace_back();
+      int success = sysctlnametomib(sysctlString.data(), result.back().mib, &length);
+      if (success < 0) {
+        return std::unexpected{std::format("Error calling sysctl: {}", errno)};
+      }
+    }
+    return result;
+  }
+
+  const std::expected<std::vector<CpuTempMibEntry>, std::string> cpuTempMibs = getAllCpuTempMibs();
+
+  noctalia::system::cpu_temp::ProbeResult readCpuTempSensor(const SystemConfig::MonitorConfig& /*unused*/) {
+    if (!cpuTempMibs.has_value()) {
+      return noctalia::system::cpu_temp::ProbeResult{.reading = std::nullopt, .error = cpuTempMibs.error()};
+    }
+
+    size_t tempAverageDecikelvin = 0;
+    const size_t nameLength = CPU_TEMP_MIB_LEN;
+    for (const CpuTempMibEntry& mibEntry : cpuTempMibs.value()) {
+      size_t tempDeciKelvin = 0;
+      size_t len = sizeof(size_t);
+      int success = sysctl(mibEntry.mib, nameLength, &tempDeciKelvin, &len, nullptr, 0);
       if (success < 0) {
         return noctalia::system::cpu_temp::ProbeResult{
             .reading = std::nullopt, .error = std::format("Error calling sysctl: {}", errno)
         };
       } else
-        coreTemperatureReading[i] = temperature;
+        tempAverageDecikelvin += tempDeciKelvin;
     }
-    size_t tempAverageDecikelvin = std::reduce(
-                                       coreTemperatureReading.begin(), coreTemperatureReading.end(), size_t(0),
-                                       [](size_t a, size_t b) { return a + b; }
-                                   )
-        / coreTemperatureReading.size();
+    tempAverageDecikelvin /= cpuTempMibs.value().size();
+
     return noctalia::system::cpu_temp::ProbeResult{
         .reading =
             noctalia::system::cpu_temp::Reading{
