@@ -445,25 +445,14 @@ namespace {
     auto ncpu = getCpuCount();
     if (!ncpu.has_value())
       return std::unexpected{"Sysctl hw.ncpu failed."};
-
-    constexpr size_t CPU_MAX_CORES = 10000;
-    if (*ncpu >= CPU_MAX_CORES) {
+    if (*ncpu >= 10000) {
       return std::unexpected{"Too many cores reported, this doesn't make sense."};
     }
 
-    constexpr size_t CPU_MAX_CORES_DIGITS = [](size_t maxCores) consteval -> size_t {
-      size_t result = 1;
-      while (maxCores >= 10) {
-        maxCores /= 10;
-        ++result;
-      }
-      return result;
-    }(CPU_MAX_CORES);
-
     std::vector<CpuTempMibEntry> result;
     result.reserve(*ncpu);
-    constexpr std::string_view FIRST_CORE_TEMP_SYSCTL = "dev.cpu.0.temperature";
-    constexpr size_t MAX_SYSCTL_LEN = FIRST_CORE_TEMP_SYSCTL.size() + CPU_MAX_CORES_DIGITS;
+    constexpr size_t MAX_SYSCTL_LEN =
+        std::string_view("dev.cpu.0.temperature").size() + std::numeric_limits<size_t>::digits10;
     std::array<char, MAX_SYSCTL_LEN + 1> sysctlString{0};
     for (size_t i = 0; i < *ncpu; ++i) {
       std::snprintf(sysctlString.data(), MAX_SYSCTL_LEN, "dev.cpu.%zu.temperature", i);
