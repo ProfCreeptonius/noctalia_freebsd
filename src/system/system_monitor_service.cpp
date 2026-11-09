@@ -419,16 +419,6 @@ namespace {
     return total;
   }
 
-  /// Obtains CPU count, or returns empty optional on error. FreeBSD-Specific implementation.
-  std::optional<size_t> getCpuCount() {
-    size_t ncpu = 0;
-    size_t len = sizeof(size_t);
-    int success = sysctlbyname("hw.ncpu", &ncpu, &len, nullptr, 0);
-    if (success < 0) {
-      return std::nullopt;
-    }
-    return std::optional{ncpu};
-  }
 
   double decikelvinToCelsius(size_t decikelvin) {
     constexpr size_t DECIKELVIN_CONVERSION_CONSTANT = 2731;
@@ -442,7 +432,7 @@ namespace {
   };
 
   std::expected<std::vector<CpuTempMibEntry>, std::string> getAllCpuTempMibs() {
-    auto ncpu = getCpuCount();
+    auto ncpu = noctalia::system::cpu_stat::getCpuCount();
     if (!ncpu.has_value())
       return std::unexpected{"Sysctl hw.ncpu failed."};
     if (*ncpu >= 10000) {
@@ -486,7 +476,7 @@ namespace {
       } else
         tempAverageDecikelvin += tempDeciKelvin;
     }
-    tempAverageDecikelvin /= cpuTempMibs.value().size();
+    tempAverageDecikelvin /= cpuTempMibs->size();
 
     return noctalia::system::cpu_temp::ProbeResult{
         .reading =

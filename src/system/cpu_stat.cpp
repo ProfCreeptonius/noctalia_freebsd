@@ -3,8 +3,15 @@
 #include "util/sys_utils.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <fstream>
+#include <numeric>
 #include <sstream>
+
+// FreeBSD specific includes
+
+#include <sys/resource.h>
+#include <sys/sysctl.h>
 
 namespace noctalia::system::cpu_stat {
 
@@ -60,51 +67,83 @@ namespace noctalia::system::cpu_stat {
     return std::clamp(100.0 * busy, 0.0, 100.0);
   }
 
-  std::optional<Totals> readTotals(const std::filesystem::path& statPath) {
-    std::ifstream file{statPath};
-    if (!file.is_open()) {
+  std::optional<size_t> getCpuCount() {
+    size_t ncpu = 0;
+    size_t len = sizeof(size_t);
+    int ncpuMib[2] = {CTL_HW, HW_NCPU};
+    int success = sysctl(ncpuMib, 2, &ncpu, &len, nullptr, 0);
+    if (success < 0) {
       return std::nullopt;
     }
-
-    std::string line;
-    if (!std::getline(file, line)) {
-      return std::nullopt;
-    }
-
-    return parseLine(line, "cpu");
+    return std::optional{ncpu};
   }
 
-  std::optional<std::vector<Totals>> readCoreTotals(const std::filesystem::path& statPath) {
-    std::ifstream file{statPath};
-    if (!file.is_open()) {
-      return std::nullopt;
+  constexpr unsigned CP_TIME_MIB_LEN = 2;
+
+  struct CpTimeMib {
+    int mib[CP_TIME_MIB_LEN];
+  };
+
+  std::optional<CpTimeMib> getCpTimeMib() {
+    size_t len;
+    CpTimeMib result;
+    int success = sysctlnametomib("kern.cp_time", result.mib, &len);
+    if (success < 0) {
+      return {};
+    }
+    return result;
+  }
+
+
+  // We cache the CP time mib. According to `man 3 sysctl`, sysctlbyname takes approximately 3x longer than sysctl.
+  static const std::optional<CpTimeMib> cpTimeMib = getCpTimeMib();
+
+  std::optional<Totals> readTotals(const std::filesystem::path& /*unused*/) {
+    if (!cpTimeMib.has_value())
+      return {};
+    std::array<size_t, CPUSTATES> cpuValues = {0};
+    size_t len = sizeof(cpuValues);
+    int success = sysctl(cpTimeMib->mib, CP_TIME_MIB_LEN, &cpuValues, &len, nullptr, 0);
+    if (success < 0) {
+      return {};
     }
 
-    std::vector<Totals> cores;
-    std::string line;
-    // The cpu rows lead the file, so stop at the first row that is not one rather than scanning
-    // the whole of /proc/stat.
-    while (std::getline(file, line)) {
-      const std::string_view label = labelOf(line);
-      if (label == "cpu") {
-        continue; // the aggregate row
-      }
-      if (!isCoreLabel(label)) {
-        break;
-      }
-      // The expected label comes from the row itself: offline cores are omitted from /proc/stat,
-      // so predicting "cpu" + cores.size() would desync permanently at the first gap.
-      const auto totals = parseLine(line, label);
-      if (!totals.has_value()) {
-        return std::nullopt;
-      }
-      cores.push_back(*totals);
+    return Totals{.total = std::accumulate(cpuValues.begin(), cpuValues.end(), 0U), .idle = cpuValues[CP_IDLE]};
+  }
+
+  std::optional<CpTimeMib> getAllCpTimeMib() {
+    size_t len;
+    CpTimeMib result;
+    int success = sysctlnametomib("kern.cp_times", result.mib, &len);
+    if (success < 0) {
+      return {};
+    }
+    return result;
+  }
+
+  // Same caching idea to avoid sysctlbyname.
+  static const std::optional<CpTimeMib> allCpTimesMib = getAllCpTimeMib();
+
+  std::optional<std::vector<Totals>> readCoreTotals(const std::filesystem::path& /*unused*/) {
+    if (!allCpTimesMib.has_value())
+      return {};
+    auto ncpu = getCpuCount();
+    if (!ncpu.has_value())
+      return {};
+    std::vector<std::array<size_t, CPUSTATES>> cpu_times(*ncpu);
+    std::memset(cpu_times.data(), 0, cpu_times.size());
+    size_t len = sizeof(size_t) * CPUSTATES * (*ncpu);
+    int success = sysctl(allCpTimesMib->mib, CP_TIME_MIB_LEN, cpu_times.data(), &len, nullptr, 0);
+    if (success < 0) {
+      return {};
     }
 
-    if (cores.empty()) {
-      return std::nullopt;
+    std::vector<Totals> totals(*ncpu);
+    for (size_t i = 0; i < *ncpu; ++i) {
+      totals[i].idle = cpu_times[i][CP_IDLE];
+      totals[i].total = std::accumulate(cpu_times[i].begin(), cpu_times[i].end(), 0U);
     }
-    return cores;
+    return totals;
   }
 
 } // namespace noctalia::system::cpu_stat

@@ -34,4 +34,7 @@ namespace noctalia::system::cpu_stat {
   // holds one that does not parse.
   [[nodiscard]] std::optional<std::vector<Totals>> readCoreTotals(const std::filesystem::path& statPath = "/proc/stat");
 
+  // Obtains the number of CPUs
+  [[nodiscard]] std::optional<size_t> getCpuCount();
+
 } // namespace noctalia::system::cpu_stat
