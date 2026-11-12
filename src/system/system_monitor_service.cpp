@@ -24,6 +24,7 @@
 #include <sstream>
 #include <string>
 #include <sys/statvfs.h>
+#include <unistd.h>
 #include <unordered_map>
 #include <vector>
 
@@ -418,7 +419,6 @@ namespace {
                                     : std::format("amdgpu sysfs ({} devices)", deviceCount);
     return total;
   }
-
 
   double decikelvinToCelsius(size_t decikelvin) {
     constexpr size_t DECIKELVIN_CONVERSION_CONSTANT = 2731;
@@ -1647,51 +1647,82 @@ void SystemMonitorService::releaseGpuReaders() {
   m_intelGpuReader.reset();
 }
 
+struct MemoryMibs {
+  std::array<int, 4> activeMemPagesMib;
+  std::array<int, 2> physMemBytesMib;
+  std::array<int, 4> swapUsageBytesMib;
+  std::array<int, 2> swapTotalBytesMib;
+};
+
+std::optional<MemoryMibs> getMemoryMibs() {
+  MemoryMibs result;
+
+  size_t mibLen = result.activeMemPagesMib.size();
+  int status = sysctlnametomib("vm.stats.vm.v_active_count", result.activeMemPagesMib.data(), &mibLen);
+  if (status < 0) {
+    return std::nullopt;
+  }
+
+  mibLen = result.physMemBytesMib.size();
+  status = sysctlnametomib("hw.physmem", result.physMemBytesMib.data(), &mibLen);
+  if (status < 0) {
+    return std::nullopt;
+  }
+
+  mibLen = result.swapTotalBytesMib.size();
+  status = sysctlnametomib("vm.swap_total", result.swapTotalBytesMib.data(), &mibLen);
+  if (status < 0) {
+    return std::nullopt;
+  }
+
+  mibLen = result.swapUsageBytesMib.size();
+  status = sysctlnametomib("vm.stats.vm.v_swapout", result.swapUsageBytesMib.data(), &mibLen);
+  if (status < 0) {
+    return std::nullopt;
+  }
+
+  return result;
+};
+
+const std::optional<MemoryMibs> memoryMibs = getMemoryMibs();
+
+const size_t kPageSize = static_cast<size_t>(getpagesize());
+
 std::optional<SystemMonitorService::MemData> SystemMonitorService::readMemoryKb() {
-  std::ifstream file{"/proc/meminfo"};
-  if (!file.is_open()) {
+  MemData result = {0};
+  if (!memoryMibs.has_value())
     return std::nullopt;
-  }
 
-  std::string key;
-  std::uint64_t value_kb = 0;
-  std::string unit;
-
-  std::uint64_t totalKb = 0;
-  std::uint64_t availableKb = 0;
-  std::uint64_t swapTotalKb = 0;
-  std::uint64_t swapFreeKb = 0;
-
-  while (file >> key >> value_kb >> unit) {
-    if (key == "MemTotal:") {
-      totalKb = value_kb;
-    } else if (key == "MemAvailable:") {
-      availableKb = value_kb;
-    } else if (key == "SwapTotal:") {
-      swapTotalKb = value_kb;
-    } else if (key == "SwapFree:") {
-      swapFreeKb = value_kb;
-    }
-
-    // SwapFree appears last, after that there's nothing we need
-    if (key == "SwapFree:") {
-      break;
-    }
-  }
-
-  if (totalKb == 0 || availableKb == 0 || availableKb > totalKb) {
+  size_t val = 0;
+  size_t len = sizeof(size_t);
+  int status = sysctl(memoryMibs->physMemBytesMib.data(), memoryMibs->physMemBytesMib.size(), &val, &len, nullptr, 0);
+  if (status < 0)
     return std::nullopt;
-  }
+  result.totalKb = val / 1024;
 
-  std::uint64_t zfsArcKb = readZfsEvictableArcKb();
-  availableKb = std::min(availableKb + zfsArcKb, totalKb);
 
-  MemData data;
-  data.totalKb = totalKb;
-  data.usedKb = totalKb - availableKb;
-  data.swapTotalKb = swapTotalKb;
-  data.swapUsedKb = swapTotalKb > swapFreeKb ? swapTotalKb - swapFreeKb : 0;
-  return data;
+  val = 0;
+  len = sizeof(size_t);
+  status = sysctl(memoryMibs->activeMemPagesMib.data(), memoryMibs->activeMemPagesMib.size(), &val, &len, nullptr, 0);
+  if (status < 0)
+    return std::nullopt;
+  result.usedKb = val * kPageSize / 1024;
+
+  val = 0;
+  len = sizeof(size_t);
+  status = sysctl(memoryMibs->swapTotalBytesMib.data(), memoryMibs->swapTotalBytesMib.size(), &val, &len, nullptr, 0);
+  if (status < 0)
+    return std::nullopt;
+  result.swapTotalKb = val / 1024;
+
+  val = 0;
+  len = sizeof(size_t);
+  status = sysctl(memoryMibs->swapUsageBytesMib.data(), memoryMibs->swapUsageBytesMib.size(), &val, &len, nullptr, 0);
+  if (status < 0)
+    return std::nullopt;
+  result.swapUsedKb = val / 1024;
+
+  return result;
 }
 
 std::optional<double> SystemMonitorService::readCpuTempCelsius(const SystemConfig::MonitorConfig& config) {
